@@ -98,6 +98,24 @@ cur.execute('SELECT * FROM system.runtime.nodes')
 rows = cur.fetchall()
 ```
 
+# Certificate Authentication
+- `CertificateAuthentication` class can be used to connect to Trino cluster configured with [certificate based authentication](https://trino.io/docs/current/security/certificate.html). `CertificateAuthentication` requires paths to a valid client certificate and private key.
+```python
+import trino
+conn = trino.dbapi.connect(
+    host='coordinator-url',
+    port=8443,
+    user='the-user',
+    catalog='the-catalog',
+    schema='the-schema',
+    http_scheme='https',
+    auth=trino.auth.CertificateAuthentication("/path/to/cert", "/path/to/key"),
+)
+cur = conn.cursor()
+cur.execute('SELECT * FROM system.runtime.nodes')
+rows = cur.fetchall()
+```
+
 # Transactions
 The client runs by default in *autocommit* mode. To enable transactions, set
 *isolation_level* to a value different than `IsolationLevel.AUTOCOMMIT`:
@@ -124,6 +142,24 @@ The transaction is created when the first SQL statement is executed.
 `trino.dbapi.Connection.commit()` will be automatically called when the code
 exits the *with* context and the queries succeed, otherwise
 `trino.dbapi.Connection.rollback()` will be called.
+
+# Extra Credential
+
+Send [`extra credentials`](https://trino.io/docs/current/develop/client-protocol.html#client-request-headers):
+
+```python
+import trino
+conn = trino.dbapi.connect(
+    host='localhost',
+    port=443,
+    user='the-user',
+    extra_credential=[('a.username', 'bar'), ('a.password', 'foo')],
+)
+
+cur = conn.cursor()
+cur.execute('SELECT * FROM system.runtime.nodes')
+rows = cur.fetchall()
+```
 
 # Development
 
