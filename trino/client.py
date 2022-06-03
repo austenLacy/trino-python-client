@@ -36,9 +36,12 @@ The main interface is :class:`TrinoQuery`: ::
 import copy
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
 import urllib.parse
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import pytz
 import requests
 
 import trino.logging
@@ -58,6 +61,10 @@ else:
 
 _HEADER_EXTRA_CREDENTIAL_KEY_REGEX = re.compile(r'^\S[^\s=]*$')
 
+INF = float("inf")
+NEGATIVE_INF = float("-inf")
+NAN = float("nan")
+
 
 class ClientSession(object):
     def __init__(
@@ -70,6 +77,7 @@ class ClientSession(object):
         headers=None,
         transaction_id=None,
         extra_credential=None,
+        client_tags=None
     ):
         self.catalog = catalog
         self.schema = schema
@@ -81,6 +89,7 @@ class ClientSession(object):
         self._headers = headers or {}
         self.transaction_id = transaction_id
         self.extra_credential = extra_credential
+        self.client_tags = client_tags
 
     @property
     def properties(self):
@@ -104,12 +113,13 @@ def get_session_property_values(headers, header):
 
 
 class TrinoStatus(object):
-    def __init__(self, id, stats, warnings, info_uri, next_uri, rows, columns=None):
+    def __init__(self, id, stats, warnings, info_uri, next_uri, update_type, rows, columns=None):
         self.id = id
         self.stats = stats
         self.warnings = warnings
         self.info_uri = info_uri
         self.next_uri = next_uri
+        self.update_type = update_type
         self.rows = rows
         self.columns = columns
 
@@ -218,7 +228,8 @@ class TrinoRequest(object):
         max_attempts: int = MAX_ATTEMPTS,
         request_timeout: Union[float, Tuple[float, float]] = constants.DEFAULT_REQUEST_TIMEOUT,
         handle_retry=exceptions.RetryWithExponentialBackoff(),
-        verify: bool = True
+        verify: bool = True,
+        client_tags: Optional[List[str]] = None
     ) -> None:
         self._client_session = ClientSession(
             catalog,
@@ -229,6 +240,7 @@ class TrinoRequest(object):
             http_headers,
             transaction_id,
             extra_credential,
+            client_tags
         )
 
         self._host = host
@@ -278,6 +290,8 @@ class TrinoRequest(object):
         headers[constants.HEADER_SCHEMA] = self._client_session.schema
         headers[constants.HEADER_SOURCE] = self._client_session.source
         headers[constants.HEADER_USER] = self._client_session.user
+        if self._client_session.client_tags is not None and len(self._client_session.client_tags) > 0:
+            headers[constants.HEADER_CLIENT_TAGS] = ",".join(self._client_session.client_tags)
 
         headers[constants.HEADER_SESSION] = ",".join(
             # ``name`` must not contain ``=``
@@ -445,6 +459,7 @@ class TrinoRequest(object):
             warnings=response.get("warnings", []),
             info_uri=response["infoUri"],
             next_uri=self._next_uri,
+            update_type=response.get("updateType"),
             rows=response.get("data", []),
             columns=response.get("columns"),
         )
@@ -472,10 +487,11 @@ class TrinoResult(object):
     https://docs.python.org/3/library/stdtypes.html#generator-types
     """
 
-    def __init__(self, query, rows=None):
+    def __init__(self, query, rows=None, experimental_python_types: bool = False):
         self._query = query
         self._rows = rows or []
         self._rownumber = 0
+        self._experimental_python_types = experimental_python_types
 
     @property
     def rownumber(self) -> int:
@@ -494,20 +510,98 @@ class TrinoResult(object):
             for row in rows:
                 self._rownumber += 1
                 logger.debug("row %s", row)
-                yield row
+                if not self._experimental_python_types:
+                    yield row
+                else:
+                    yield self._map_to_python_types(row, self._query.columns)
 
     @property
     def response_headers(self):
         return self._query.response_headers
+
+    @classmethod
+    def _map_to_python_type(cls, item: Tuple[Any, Dict]) -> Any:
+        (value, data_type) = item
+
+        if value is None:
+            return None
+
+        raw_type = data_type["typeSignature"]["rawType"]
+
+        try:
+            if isinstance(value, list):
+                if raw_type == "array":
+                    raw_type = {
+                        "typeSignature": data_type["typeSignature"]["arguments"][0]["value"]
+                    }
+                    return [cls._map_to_python_type((array_item, raw_type)) for array_item in value]
+                if raw_type == "row":
+                    raw_types = map(lambda arg: arg["value"], data_type["typeSignature"]["arguments"])
+                    return tuple(
+                        cls._map_to_python_type((array_item, raw_type))
+                        for (array_item, raw_type) in zip(value, raw_types)
+                    )
+                return value
+            if isinstance(value, dict):
+                raw_key_type = {
+                    "typeSignature": data_type["typeSignature"]["arguments"][0]["value"]
+                }
+                raw_value_type = {
+                    "typeSignature": data_type["typeSignature"]["arguments"][1]["value"]
+                }
+                return {
+                    cls._map_to_python_type((key, raw_key_type)):
+                        cls._map_to_python_type((value[key], raw_value_type))
+                    for key in value
+                }
+            elif "decimal" in raw_type:
+                return Decimal(value)
+            elif raw_type == "double":
+                if value == 'Infinity':
+                    return INF
+                elif value == '-Infinity':
+                    return NEGATIVE_INF
+                elif value == 'NaN':
+                    return NAN
+                return value
+            elif raw_type == "date":
+                return datetime.strptime(value, "%Y-%m-%d").date()
+            elif raw_type == "timestamp with time zone":
+                dt, tz = value.rsplit(' ', 1)
+                if tz.startswith('+') or tz.startswith('-'):
+                    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S.%f %z")
+                return datetime.strptime(dt, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=pytz.timezone(tz))
+            elif "timestamp" in raw_type:
+                return datetime.strptime(value, "%Y-%m-%d %H:%M:%S.%f")
+            elif "time with time zone" in raw_type:
+                matches = re.match(r'^(.*)([\+\-])(\d{2}):(\d{2})$', value)
+                assert matches is not None
+                assert len(matches.groups()) == 4
+                if matches.group(2) == '-':
+                    tz = -timedelta(hours=int(matches.group(3)), minutes=int(matches.group(4)))
+                else:
+                    tz = timedelta(hours=int(matches.group(3)), minutes=int(matches.group(4)))
+                return datetime.strptime(matches.group(1), "%H:%M:%S.%f").time().replace(tzinfo=timezone(tz))
+            elif "time" in raw_type:
+                return datetime.strptime(value, "%H:%M:%S.%f").time()
+            else:
+                return value
+        except ValueError as e:
+            error_str = f"Could not convert '{value}' into the associated python type for '{raw_type}'"
+            raise trino.exceptions.TrinoDataError(error_str) from e
+
+    def _map_to_python_types(self, row: List[Any], columns: List[Dict[str, Any]]) -> List[Any]:
+        return list(map(self._map_to_python_type, zip(row, columns)))
 
 
 class TrinoQuery(object):
     """Represent the execution of a SQL statement by Trino."""
 
     def __init__(
-        self,
-        request: TrinoRequest,
-        sql: str,
+            self,
+            request: TrinoRequest,
+            sql: str,
+            experimental_python_types: bool = False,
     ) -> None:
         self.query_id: Optional[str] = None
 
@@ -518,9 +612,11 @@ class TrinoQuery(object):
         self._finished = False
         self._cancelled = False
         self._request = request
+        self._update_type = None
         self._sql = sql
-        self._result = TrinoResult(self)
+        self._result = TrinoResult(self, experimental_python_types=experimental_python_types)
         self._response_headers = None
+        self._experimental_python_types = experimental_python_types
 
     @property
     def columns(self):
@@ -534,6 +630,10 @@ class TrinoQuery(object):
     @property
     def stats(self):
         return self._stats
+
+    @property
+    def update_type(self):
+        return self._update_type
 
     @property
     def warnings(self):
@@ -567,11 +667,12 @@ class TrinoQuery(object):
         self._warnings = getattr(status, "warnings", [])
         if status.next_uri is None:
             self._finished = True
-        self._result = TrinoResult(self, status.rows)
+        self._result = TrinoResult(self, status.rows, self._experimental_python_types)
         return self._result
 
     def _update_state(self, status):
         self._stats.update(status.stats)
+        self._update_type = status.update_type
         if status.columns:
             self._columns = status.columns
 

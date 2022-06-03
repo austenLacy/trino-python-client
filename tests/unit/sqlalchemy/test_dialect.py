@@ -7,7 +7,7 @@ from sqlalchemy.engine.url import URL
 
 from trino.auth import BasicAuthentication
 from trino.dbapi import Connection
-from trino.sqlalchemy.dialect import TrinoDialect
+from trino.sqlalchemy.dialect import CertificateAuthentication, JWTAuthentication, TrinoDialect
 from trino.transaction import IsolationLevel
 
 
@@ -15,22 +15,21 @@ class TestTrinoDialect:
     def setup(self):
         self.dialect = TrinoDialect()
 
-    # TODO: Test more authentication methods and URL params (https://github.com/trinodb/trino-python-client/issues/106)
     @pytest.mark.parametrize(
         "url, expected_args, expected_kwargs",
         [
             (
                 make_url("trino://user@localhost"),
                 list(),
-                dict(host="localhost", catalog="system", user="user"),
+                dict(host="localhost", catalog="system", user="user", source="trino-sqlalchemy"),
             ),
             (
                 make_url("trino://user@localhost:8080"),
                 list(),
-                dict(host="localhost", port=8080, catalog="system", user="user"),
+                dict(host="localhost", port=8080, catalog="system", user="user", source="trino-sqlalchemy"),
             ),
             (
-                make_url("trino://user:pass@localhost:8080"),
+                make_url("trino://user:pass@localhost:8080?source=trino-rulez"),
                 list(),
                 dict(
                     host="localhost",
@@ -39,6 +38,27 @@ class TestTrinoDialect:
                     user="user",
                     auth=BasicAuthentication("user", "pass"),
                     http_scheme="https",
+                    source="trino-rulez"
+                ),
+            ),
+            (
+                make_url(
+                    'trino://user@localhost:8080?'
+                    'session_properties={"query_max_run_time": "1d"}'
+                    '&http_headers={"trino": 1}'
+                    '&extra_credential=[("a", "b"), ("c", "d")]'
+                    '&client_tags=[1, "sql"]'),
+                list(),
+                dict(
+                    host="localhost",
+                    port=8080,
+                    catalog="system",
+                    user="user",
+                    source="trino-sqlalchemy",
+                    session_properties={"query_max_run_time": "1d"},
+                    http_headers={"trino": 1},
+                    extra_credential=[("a", "b"), ("c", "d")],
+                    client_tags=[1, "sql"]
                 ),
             ),
         ],
@@ -71,3 +91,40 @@ class TestTrinoDialect:
 
         isolation_level = self.dialect.get_isolation_level(dbapi_conn)
         assert isolation_level == "SERIALIZABLE"
+
+
+def test_trino_connection_basic_auth():
+    dialect = TrinoDialect()
+    username = 'trino-user'
+    password = 'trino-bunny'
+    url = make_url(f'trino://{username}:{password}@host')
+    _, cparams = dialect.create_connect_args(url)
+
+    assert cparams['http_scheme'] == "https"
+    assert isinstance(cparams['auth'], BasicAuthentication)
+    assert cparams['auth']._username == username
+    assert cparams['auth']._password == password
+
+
+def test_trino_connection_jwt_auth():
+    dialect = TrinoDialect()
+    access_token = 'sample-token'
+    url = make_url(f'trino://host/?access_token={access_token}')
+    _, cparams = dialect.create_connect_args(url)
+
+    assert cparams['http_scheme'] == "https"
+    assert isinstance(cparams['auth'], JWTAuthentication)
+    assert cparams['auth'].token == access_token
+
+
+def test_trino_connection_certificate_auth():
+    dialect = TrinoDialect()
+    cert = '/path/to/cert.pem'
+    key = '/path/to/key.pem'
+    url = make_url(f'trino://host/?cert={cert}&key={key}')
+    _, cparams = dialect.create_connect_args(url)
+
+    assert cparams['http_scheme'] == "https"
+    assert isinstance(cparams['auth'], CertificateAuthentication)
+    assert cparams['auth']._cert == cert
+    assert cparams['auth']._key == key

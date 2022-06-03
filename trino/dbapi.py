@@ -17,7 +17,7 @@ https://www.python.org/dev/peps/pep-0249/ .
 Fetch methods returns rows as a list of lists on purpose to let the caller
 decide to convert then to a list of tuples.
 """
-
+from decimal import Decimal
 from typing import Any, List, Optional  # NOQA for mypy types
 
 import copy
@@ -108,7 +108,8 @@ class Connection(object):
         request_timeout=constants.DEFAULT_REQUEST_TIMEOUT,
         isolation_level=IsolationLevel.AUTOCOMMIT,
         verify=True,
-        http_session=None
+        http_session=None,
+        client_tags=None
     ):
         self.host = host
         self.port = port
@@ -130,6 +131,7 @@ class Connection(object):
         self.redirect_handler = redirect_handler
         self.max_attempts = max_attempts
         self.request_timeout = request_timeout
+        self.client_tags = client_tags
 
         self._isolation_level = isolation_level
         self._request = None
@@ -194,17 +196,20 @@ class Connection(object):
             self.redirect_handler,
             self.max_attempts,
             self.request_timeout,
+            client_tags=self.client_tags
         )
 
-    def cursor(self):
+    def cursor(self, experimental_python_types=False):
         """Return a new :py:class:`Cursor` object using the connection."""
         if self.isolation_level != IsolationLevel.AUTOCOMMIT:
             if self.transaction is None:
                 self.start_transaction()
             request = self.transaction._request
+        elif self.transaction is not None:
+            request = self.transaction._request
         else:
             request = self._create_request()
-        return Cursor(self, request)
+        return Cursor(self, request, experimental_python_types)
 
 
 class Cursor(object):
@@ -215,7 +220,7 @@ class Cursor(object):
 
     """
 
-    def __init__(self, connection, request):
+    def __init__(self, connection, request, experimental_python_types: bool = False):
         if not isinstance(connection, Connection):
             raise ValueError(
                 "connection must be a Connection object: {}".format(type(connection))
@@ -226,6 +231,7 @@ class Cursor(object):
         self.arraysize = 1
         self._iterator = None
         self._query = None
+        self._experimental_pyton_types = experimental_python_types
 
     def __iter__(self):
         return self._iterator
@@ -238,6 +244,12 @@ class Cursor(object):
     def info_uri(self):
         if self._query is not None:
             return self._query.info_uri
+        return None
+
+    @property
+    def update_type(self):
+        if self._query is not None:
+            return self._query.update_type
         return None
 
     @property
@@ -303,7 +315,8 @@ class Cursor(object):
 
         # Send prepare statement. Copy the _request object to avoid poluting the
         # one that is going to be used to execute the actual operation.
-        query = trino.client.TrinoQuery(copy.deepcopy(self._request), sql=sql)
+        query = trino.client.TrinoQuery(copy.deepcopy(self._request), sql=sql,
+                                        experimental_python_types=self._experimental_pyton_types)
         result = query.execute()
 
         # Iterate until the 'X-Trino-Added-Prepare' header is found or
@@ -325,7 +338,7 @@ class Cursor(object):
 
         # No need to deepcopy _request here because this is the actual request
         # operation
-        return trino.client.TrinoQuery(self._request, sql=sql)
+        return trino.client.TrinoQuery(self._request, sql=sql, experimental_python_types=self._experimental_pyton_types)
 
     def _format_prepared_param(self, param):
         """
@@ -357,14 +370,32 @@ class Cursor(object):
         if isinstance(param, bytes):
             return "X'%s'" % param.hex()
 
-        if isinstance(param, datetime.datetime):
-            datetime_str = param.strftime("%Y-%m-%d %H:%M:%S.%f %Z")
-            # strip trailing whitespace if param has no zone
-            datetime_str = datetime_str.rstrip(" ")
+        if isinstance(param, datetime.datetime) and param.tzinfo is None:
+            datetime_str = param.strftime("%Y-%m-%d %H:%M:%S.%f")
             return "TIMESTAMP '%s'" % datetime_str
+
+        if isinstance(param, datetime.datetime) and param.tzinfo is not None:
+            datetime_str = param.strftime("%Y-%m-%d %H:%M:%S.%f")
+            # named timezones
+            if hasattr(param.tzinfo, 'zone'):
+                return "TIMESTAMP '%s %s'" % (datetime_str, param.tzinfo.zone)
+            # offset-based timezones
+            return "TIMESTAMP '%s %s'" % (datetime_str, param.tzinfo.tzname(param))
+
+        # We can't calculate the offset for a time without a point in time
+        if isinstance(param, datetime.time) and param.tzinfo is None:
+            time_str = param.strftime("%H:%M:%S.%f")
+            return "TIME '%s'" % time_str
+
+        if isinstance(param, datetime.date):
+            date_str = param.strftime("%Y-%m-%d")
+            return "DATE '%s'" % date_str
 
         if isinstance(param, list):
             return "ARRAY[%s]" % ','.join(map(self._format_prepared_param, param))
+
+        if isinstance(param, tuple):
+            return "ROW(%s)" % ','.join(map(self._format_prepared_param, param))
 
         if isinstance(param, dict):
             keys = list(param.keys())
@@ -377,6 +408,9 @@ class Cursor(object):
         if isinstance(param, uuid.UUID):
             return "UUID '%s'" % param
 
+        if isinstance(param, Decimal):
+            return "DECIMAL '%s'" % param
+
         raise trino.exceptions.NotSupportedError("Query parameter of type '%s' is not supported." % type(param))
 
     def _deallocate_prepare_statement(self, added_prepare_header, statement_name):
@@ -384,7 +418,8 @@ class Cursor(object):
 
         # Send deallocate statement. Copy the _request object to avoid poluting the
         # one that is going to be used to execute the actual operation.
-        query = trino.client.TrinoQuery(copy.deepcopy(self._request), sql=sql)
+        query = trino.client.TrinoQuery(copy.deepcopy(self._request), sql=sql,
+                                        experimental_python_types=self._experimental_pyton_types)
         result = query.execute(
             additional_http_headers={
                 constants.HEADER_PREPARED_STATEMENT: added_prepare_header
@@ -435,13 +470,37 @@ class Cursor(object):
                 self._deallocate_prepare_statement(added_prepare_header, statement_name)
 
         else:
-            self._query = trino.client.TrinoQuery(self._request, sql=operation)
+            self._query = trino.client.TrinoQuery(self._request, sql=operation,
+                                                  experimental_python_types=self._experimental_pyton_types)
             result = self._query.execute()
         self._iterator = iter(result)
         return result
 
     def executemany(self, operation, seq_of_params):
-        raise trino.exceptions.NotSupportedError
+        """
+        PEP-0249: Prepare a database operation (query or command) and then
+        execute it against all parameter sequences or mappings found in the sequence seq_of_parameters.
+        Modules are free to implement this method using multiple calls to
+        the .execute() method or by using array operations to have the
+        database process the sequence as a whole in one call.
+
+        Use of this method for an operation which produces one or more result
+        sets constitutes undefined behavior, and the implementation is permitted (but not required)
+        to raise an exception when it detects that a result set has been created by an invocation of the operation.
+
+        The same comments as for .execute() also apply accordingly to this method.
+
+        Return values are not defined.
+        """
+        for parameters in seq_of_params[:-1]:
+            self.execute(operation, parameters)
+            self.fetchall()
+            if self._query.update_type is None:
+                raise NotSupportedError("Query must return update type")
+        if seq_of_params:
+            self.execute(operation, seq_of_params[-1])
+        else:
+            self.execute(operation)
 
     def fetchone(self) -> Optional[List[Any]]:
         """
@@ -454,6 +513,7 @@ class Cursor(object):
         """
 
         try:
+            assert self._iterator is not None
             return next(self._iterator)
         except StopIteration:
             return None
